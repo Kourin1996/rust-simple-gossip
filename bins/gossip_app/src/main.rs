@@ -1,8 +1,9 @@
 use clap::Parser;
+use gossip::GossipApp;
+use tracing::Level;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, Layer};
-use gossip::hello;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -26,12 +27,26 @@ struct Args {
 }
 
 fn main() {
-    println!("Hello, world!");
-
     let args = Args::parse();
-    println!("{:?}", args);
 
-    let env_filter = tracing_subscriber::EnvFilter::new(if args.debug { "debug" } else { "info" });
+    setup_logger(args.debug);
+
+    if args.debug {
+        tracing::debug!("Args: {:?}", args);
+    }
+
+    let initial_peers: Vec<String> = args
+        .connect
+        .map_or_else(Vec::new, |s| s.split(',').map(|s| s.to_string()).collect());
+
+    let app = GossipApp::new(args.port, args.period, initial_peers);
+    app.run();
+}
+
+fn setup_logger(is_debug: bool) {
+    let logger_level = if is_debug { Level::DEBUG } else { Level::INFO };
+
+    let env_filter = tracing_subscriber::EnvFilter::new(logger_level.as_str());
     let stdout_formatter = fmt::format().compact();
 
     let stdout_log = tracing_subscriber::fmt::layer()
@@ -39,14 +54,4 @@ fn main() {
         .with_filter(env_filter);
 
     tracing_subscriber::registry().with(stdout_log).init();
-
-    print_log();
-
-    hello();
-}
-
-fn print_log() {
-    tracing::debug!("Debugging enabled 1: {}", true);
-
-    tracing::info!("Debugging enabled 2: {}", false);
 }

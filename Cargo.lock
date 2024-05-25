@@ -124,6 +124,9 @@ dependencies = [
 [[package]]
 name = "gossip"
 version = "0.1.0"
+dependencies = [
+ "tracing",
+]
 
 [[package]]
 name = "gossip_app"
