@@ -1,4 +1,4 @@
 #!/bin/sh
 
-cargo build --release
-cp target/release/peer .
+cargo build --release --package gossip_app
+cp target/release/gossip_app ./peer

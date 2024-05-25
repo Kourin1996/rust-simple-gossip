@@ -1,0 +1,15 @@
+[package]
+name = "gossip_app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gossip.workspace = true
+clap = { version = "4.5.4", features = ["derive"] }
+tracing = "0.1.40"
+tracing-subscriber = {version = "0.3.18", features = ["env-filter"]}
+time = "0.3.36"
+
+[[bin]]
+name = "gossip_app"
+path = "src/main.rs"

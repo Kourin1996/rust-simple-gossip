@@ -122,6 +122,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gossip"
+version = "0.1.0"
+
+[[package]]
+name = "gossip_app"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "gossip",
+ "time",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -193,16 +208,6 @@ name = "pin-project-lite"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bda66fc9667c18cb2758a2ac84d1167245054bcf85d5d1aaa6923f45801bdd02"
-
-[[package]]
-name = "pj_001"
-version = "0.1.0"
-dependencies = [
- "clap",
- "time",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "powerfmt"

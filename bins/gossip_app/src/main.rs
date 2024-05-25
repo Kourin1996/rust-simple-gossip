@@ -2,6 +2,7 @@ use clap::Parser;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, Layer};
+use gossip::hello;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -40,6 +41,8 @@ fn main() {
     tracing_subscriber::registry().with(stdout_log).init();
 
     print_log();
+
+    hello();
 }
 
 fn print_log() {
