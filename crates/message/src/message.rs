@@ -2,23 +2,21 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
-pub enum MessageBody {
-    Handshake { sender: String },
-    DiscoveryRequest { sender: String },
-    DiscoveryResponse { sender: String, peers: Vec<String> },
-    GossipBroadcast { sender: String, message: String },
+pub struct Message {
+    pub sender: String,
+    pub body: MessageBody,
 }
 
-impl MessageBody {
-    pub fn sender(&self) -> String {
-        match self {
-            MessageBody::Handshake { sender } => sender.clone(),
-            MessageBody::DiscoveryRequest { sender } => sender.clone(),
-            MessageBody::DiscoveryResponse { sender, .. } => sender.clone(),
-            MessageBody::GossipBroadcast { sender, .. } => sender.clone(),
-        }
-    }
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type")]
+pub enum MessageBody {
+    Handshake,
+    DiscoveryRequest,
+    DiscoveryResponse { peers: Vec<String> },
+    GossipBroadcast { message: String },
+}
 
+impl Message {
     pub fn encode(&self) -> Vec<u8> {
         let encoded = serde_json::to_string(&self).unwrap();
         tracing::debug!("Encoding message: {:?}", encoded);

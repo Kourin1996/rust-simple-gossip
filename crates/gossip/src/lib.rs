@@ -1,5 +1,6 @@
 use connection_manager::connection_manager::ConnectionManager;
 use discovery::discovery::DiscoveryService;
+use message::message::MessageBody;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
@@ -33,7 +34,7 @@ impl GossipApp {
 
         let cancellation_token = CancellationToken::new();
 
-        let connection_manager = ConnectionManager::new(self.port);
+        let connection_manager = ConnectionManager::new(my_address);
 
         tokio::spawn({
             let connection_manager = connection_manager.clone();
@@ -45,7 +46,9 @@ impl GossipApp {
                 .collect();
 
             async move {
-                connection_manager.run(tcp_listener, initial_peers, cancellation_token);
+                connection_manager
+                    .run(tcp_listener, initial_peers, cancellation_token)
+                    .await;
             }
         });
 
@@ -69,14 +72,24 @@ impl GossipApp {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(period as u64)) => {
                             tracing::debug!("Broadcasting message to all peers");
 
-                            for (addr, peer) in connection_manager.peers().await {
+                            let peers = connection_manager.peers().await;
+                            let peer_num = peers.len();
+                            for (addr, peer) in peers {
                                 let peer = peer.clone();
                                 tokio::spawn(async move {
-                                    peer.send_message(b"Hello, world!").await.expect("Failed to send message");
+                                    let msg = MessageBody::GossipBroadcast {
+                                        message: "Hello, world".to_string(),
+                                    };
+
+                                    peer.send_message(
+                                        my_address,
+                                        msg).await.expect("Failed to send message");
 
                                     tracing::debug!("Message sent to peer: {}", addr);
                                 });
                             }
+
+                            tracing::info!("Broadcasted message to {} peers", peer_num);
                         }
                         _ = cancellation_token.cancelled() => {
                             break;
@@ -85,30 +98,6 @@ impl GossipApp {
                 }
             }
         });
-
-        // tokio::spawn({
-        //     let connection_manager = connection_manager.clone();
-        //     let (peer_event_tx, mut peer_event_rx) = mpsc::channel(1);
-        //     let cancellation_token = cancellation_token.clone();
-        //
-        //     async move {
-        //         tracing::debug!("Subscribing to peer events");
-        //         connection_manager.subscribe(peer_event_tx).await;
-        //
-        //         loop {
-        //             tokio::select! {
-        //                 _ = cancellation_token.cancelled() => {
-        //                     break;
-        //                 }
-        //                 event = peer_event_rx.recv() => {
-        //                     if let Some(event) = event {
-        //                         tracing::debug!("Received peer event: {:?}", event);
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //     }
-        // });
 
         signal::ctrl_c()
             .await

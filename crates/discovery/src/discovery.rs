@@ -1,6 +1,6 @@
 use connection_manager::connection_manager::{ConnectionManager, PeerEvent};
 use connection_manager::peer::Peer;
-use message::message::MessageBody;
+use message::message::{Message, MessageBody};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -75,9 +75,9 @@ impl DiscoveryService {
                     tracing::debug!("Received peer event: {:?}", event);
 
                     match event {
-                        PeerEvent::Connected(peer) => {
+                        PeerEvent::Connected(peer_address, peer) => {
                             // TODO: create method
-                            state.known_peers.write().await.insert(peer.address);
+                            state.known_peers.write().await.insert(peer_address);
 
                             DiscoveryService::run_discovery_request_handler(
                                 my_addr,
@@ -95,8 +95,8 @@ impl DiscoveryService {
                             )
                             .await;
                         }
-                        PeerEvent::Disconnected(peer) => {
-                            DiscoveryService::unsubscribe_message(state.clone(), peer.address)
+                        PeerEvent::Disconnected(peer_address, _peer) => {
+                            DiscoveryService::unsubscribe_message(state.clone(), peer_address)
                                 .await;
                         }
                     }
@@ -114,13 +114,14 @@ impl DiscoveryService {
         cancellation_token: CancellationToken,
     ) {
         tracing::debug!("spawning run_discovery_request_handler");
-        let (tx, rx) = mpsc::channel::<MessageBody>();
+        let (tx, rx) = mpsc::channel::<Message>();
         let mut rx = convert_mpsc_channel_to_tokio_channel(rx);
 
         tokio::spawn({
             let id = peer.subscribe(tx).await;
+            let address = peer.address().await.unwrap();
 
-            tracing::debug!("Subscribed to peer message: {}", peer.address);
+            tracing::debug!("Subscribed to peer message: {}", address);
 
             async move {
                 loop {
@@ -130,16 +131,18 @@ impl DiscoveryService {
                             break;
                         }
                         msg = rx.recv() => {
+
                             match msg {
-                                Some(MessageBody::DiscoveryRequest { sender }) => {
+                                Some(Message{sender, body: MessageBody::DiscoveryRequest {},..}) => {
                                     tracing::debug!("Received DiscoveryRequest from {}", sender);
 
+                                    let sender = sender.parse().unwrap();
                                     let peers = known_peers
                                         .read()
                                         .await
                                         .iter()
                                         .filter_map(|addr| {
-                                            if *addr != my_addr && *addr != peer.address {
+                                            if *addr != my_addr && *addr != sender {
                                                 Some(addr.to_string())
                                             } else {
                                                 None
@@ -147,12 +150,10 @@ impl DiscoveryService {
                                         .collect::<Vec<_>>();
 
                                     let response_message = MessageBody::DiscoveryResponse {
-                                        sender: my_addr.to_string(),
                                         peers,
-                                    }
-                                    .encode();
+                                    };
 
-                                    let _ = peer.send_message(response_message.as_slice()).await;
+                                    let _ = peer.send_message(my_addr, response_message).await;
 
                                     tracing::debug!("Sent DiscoveryResponse to {}", sender);
                                 }
@@ -174,10 +175,10 @@ impl DiscoveryService {
         cancellation_token: CancellationToken,
     ) {
         tokio::spawn({
-            let peer_addr = peer.address;
+            let peer_addr = peer.address().await.unwrap();
 
             async move {
-                let (tx, rx) = mpsc::channel::<MessageBody>();
+                let (tx, rx) = mpsc::channel::<Message>();
 
                 let subscription_index = peer.subscribe(tx).await;
                 let _ = state.peer_subscription_map.write().await.insert(
@@ -188,16 +189,13 @@ impl DiscoveryService {
                     },
                 );
 
-                let request_message = MessageBody::DiscoveryRequest {
-                    sender: my_addr.to_string(),
-                }
-                .encode();
+                let request_message = MessageBody::DiscoveryRequest {};
 
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
                         return;
                     }
-                    _ = peer.send_message(request_message.as_slice()) => {}
+                    _ = peer.send_message(my_addr, request_message) => {}
                 }
 
                 tracing::debug!("Sent DiscoveryRequest to {}", peer_addr);
@@ -220,12 +218,15 @@ impl DiscoveryService {
                         }
                     };
 
-                    if msg.sender() != peer_addr.to_string() {
+                    if msg.sender != peer_addr.to_string() {
                         continue;
                     }
 
                     match msg {
-                        MessageBody::DiscoveryResponse { sender, peers } => {
+                        Message {
+                            sender,
+                            body: MessageBody::DiscoveryResponse { peers, .. },
+                        } => {
                             tracing::debug!(
                                 "Received DiscoveryResponse from {} peers={:?}",
                                 sender,
