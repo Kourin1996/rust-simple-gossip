@@ -1,10 +1,13 @@
 [workspace]
-members = ["bins/gossip_app", "crates/gossip"]
+members = ["bins/gossip-app", "crates/connection-manager", "crates/gossip"]
 resolver = "2"
 # default-members =[]
 
 [workspace.dependencies]
 gossip = { path = "crates/gossip" }
+connection-manager = {path = "crates/connection-manager"}
 
 tracing = "0.1.40"
 tracing-subscriber = {version = "0.3.18", features = ["env-filter"]}
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7.11"

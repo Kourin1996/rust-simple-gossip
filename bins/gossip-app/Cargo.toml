@@ -1,5 +1,5 @@
 [package]
-name = "gossip_app"
+name = "gossip-app"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,6 +8,7 @@ gossip.workspace = true
 
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tokio.workspace = true
 
 clap = { version = "4.5.4", features = ["derive"] }
 time = "0.3.36"

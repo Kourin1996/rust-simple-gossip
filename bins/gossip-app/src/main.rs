@@ -26,7 +26,8 @@ struct Args {
     debug: bool,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
 
     setup_logger(args.debug);
@@ -40,7 +41,7 @@ fn main() {
         .map_or_else(Vec::new, |s| s.split(',').map(|s| s.to_string()).collect());
 
     let app = GossipApp::new(args.port, args.period, initial_peers);
-    app.run();
+    app.run().await;
 }
 
 fn setup_logger(is_debug: bool) {
