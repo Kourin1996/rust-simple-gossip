@@ -1,7 +1,6 @@
 use connection_manager::connection_manager::ConnectionManager;
-use std::sync::Arc;
+use discovery::discovery::DiscoveryService;
 use tokio::signal;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub struct GossipApp {
@@ -30,10 +29,11 @@ impl GossipApp {
         let tcp_listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", self.port))
             .await
             .expect("Failed to bind to port");
+        let my_address = tcp_listener.local_addr().unwrap();
 
         let cancellation_token = CancellationToken::new();
 
-        let connection_manager = Arc::new(ConnectionManager::new());
+        let connection_manager = ConnectionManager::new(self.port);
 
         tokio::spawn({
             let connection_manager = connection_manager.clone();
@@ -49,8 +49,14 @@ impl GossipApp {
             }
         });
 
-        // TODO: Implement discovery protocol (optional)
-        // let discovery = Discovery::new(connection_manager);
+        let discovery = DiscoveryService::new(connection_manager.clone(), my_address);
+        tokio::spawn({
+            let cancellation_token = cancellation_token.clone();
+
+            async move {
+                discovery.run(cancellation_token).await;
+            }
+        });
 
         tokio::spawn({
             let connection_manager = connection_manager.clone();
@@ -80,29 +86,29 @@ impl GossipApp {
             }
         });
 
-        tokio::spawn({
-            let connection_manager = connection_manager.clone();
-            let (peer_event_tx, mut peer_event_rx) = mpsc::channel(1);
-            let cancellation_token = cancellation_token.clone();
-
-            async move {
-                tracing::debug!("Subscribing to peer events");
-                connection_manager.subscribe(peer_event_tx).await;
-
-                loop {
-                    tokio::select! {
-                        _ = cancellation_token.cancelled() => {
-                            break;
-                        }
-                        event = peer_event_rx.recv() => {
-                            if let Some(event) = event {
-                                tracing::debug!("Received peer event: {:?}", event);
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        // tokio::spawn({
+        //     let connection_manager = connection_manager.clone();
+        //     let (peer_event_tx, mut peer_event_rx) = mpsc::channel(1);
+        //     let cancellation_token = cancellation_token.clone();
+        //
+        //     async move {
+        //         tracing::debug!("Subscribing to peer events");
+        //         connection_manager.subscribe(peer_event_tx).await;
+        //
+        //         loop {
+        //             tokio::select! {
+        //                 _ = cancellation_token.cancelled() => {
+        //                     break;
+        //                 }
+        //                 event = peer_event_rx.recv() => {
+        //                     if let Some(event) = event {
+        //                         tracing::debug!("Received peer event: {:?}", event);
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //     }
+        // });
 
         signal::ctrl_c()
             .await

@@ -7,6 +7,9 @@ edition = "2021"
 
 [dependencies]
 connection-manager.workspace = true
+discovery.workspace = true
+message.workspace = true
+
 tracing.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

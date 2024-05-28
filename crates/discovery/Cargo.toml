@@ -1,12 +1,14 @@
 [package]
-name = "connection-manager"
+name = "discovery"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+connection-manager.workspace = true
 message.workspace = true
 utils.workspace = true
 
 tracing.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+futures.workspace = true
