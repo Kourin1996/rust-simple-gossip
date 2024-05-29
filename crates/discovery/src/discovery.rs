@@ -23,7 +23,7 @@ pub(self) struct SharedState {
     // maps that holds peer event subscription
     peer_subscription_map: RwLock<HashMap<SocketAddr, PeerSubscriptionEntity>>,
     // known peers
-    known_peers: Arc<RwLock<HashSet<SocketAddr>>>,
+    known_peers: RwLock<HashSet<SocketAddr>>,
 }
 
 #[derive(Debug)]
@@ -39,7 +39,7 @@ impl DiscoveryService {
             state: Arc::new(SharedState {
                 connection_manager,
                 peer_subscription_map: RwLock::new(HashMap::new()),
-                known_peers: Arc::new(RwLock::new(HashSet::new())),
+                known_peers: RwLock::new(HashSet::new()),
             }),
         }
     }
@@ -109,8 +109,8 @@ impl DiscoveryService {
         state.known_peers.write().await.insert(peer_address);
 
         DiscoveryService::run_discovery_request_handler(
+            state.clone(),
             my_address,
-            state.known_peers.clone(),
             peer.clone(),
             cancellation_token.clone(),
         )
@@ -126,8 +126,8 @@ impl DiscoveryService {
     }
 
     async fn run_discovery_request_handler(
+        state: Arc<SharedState>,
         my_addr: SocketAddr,
-        known_peers: Arc<RwLock<HashSet<SocketAddr>>>,
         mut peer: Peer,
         cancellation_token: CancellationToken,
     ) {
@@ -139,6 +139,7 @@ impl DiscoveryService {
         tokio::spawn({
             let id = peer.subscribe(tx).await;
             let address = peer.address().await.unwrap();
+            let state = state.clone();
 
             tracing::debug!("Subscribed to peer message: {}", address);
 
@@ -164,10 +165,10 @@ impl DiscoveryService {
                     };
 
                     DiscoveryService::reply_discovery_response(
+                        state.clone(),
                         peer.clone(),
                         sender,
                         my_addr,
-                        known_peers.clone(),
                     )
                     .await;
                 }
@@ -178,13 +179,14 @@ impl DiscoveryService {
     }
 
     async fn reply_discovery_response(
+        state: Arc<SharedState>,
         peer: Peer,
         sender: String,
         my_address: SocketAddr,
-        known_peers: Arc<RwLock<HashSet<SocketAddr>>>,
     ) {
         let sender = sender.parse().unwrap();
-        let peers = known_peers
+        let peers = state
+            .known_peers
             .read()
             .await
             .iter()
@@ -204,8 +206,6 @@ impl DiscoveryService {
 
         tracing::debug!("Sent DiscoveryResponse to {}, num={}", sender, peer_num);
     }
-
-    // TODO: periodically send DiscoveryRequest to the peers
 
     async fn request_peers_info(
         state: Arc<SharedState>,
@@ -230,34 +230,16 @@ impl DiscoveryService {
 
                 tracing::debug!("Sent DiscoveryRequest to {}", peer_address);
 
-                // await for the response
-                loop {
-                    let (sender, peers) = tokio::select! {
-                        _ = cancellation_token.cancelled() => {
-                            break;
-                        }
-                        msg = rx.recv() => {
-                            match msg {
-                                Some(Message {
-                                    sender,
-                                    body: MessageBody::DiscoveryResponse { peers, .. },
-                                }) => {
-                                    (sender, peers)
-                                },
-                                None => {
-                                    break
-                                }
-                                _ => {
-                                    continue;
-                                }
-                            }
-                        }
-                    };
+                let res = DiscoveryService::await_for_discovery_response(
+                    peer_address,
+                    &mut rx,
+                    cancellation_token.clone(),
+                )
+                .await;
 
-                    if sender != peer_address.to_string() {
-                        continue;
-                    }
+                DiscoveryService::unsubscribe_message(state.clone(), peer_address).await;
 
+                if let Some((sender, peers)) = res {
                     tracing::debug!(
                         "Received DiscoveryResponse from {} peers={:?}",
                         sender,
@@ -271,8 +253,6 @@ impl DiscoveryService {
                     )
                     .await;
                 }
-
-                DiscoveryService::unsubscribe_message(state, peer_address).await;
             }
         });
     }
@@ -327,6 +307,45 @@ impl DiscoveryService {
                 }
             }
             None => {}
+        }
+    }
+
+    // await for the discovery response
+    async fn await_for_discovery_response(
+        peer_address: SocketAddr,
+        rx: &mut tokio::sync::mpsc::Receiver<Message>,
+        cancellation_token: CancellationToken,
+    ) -> Option<(String, Vec<String>)> {
+        loop {
+            let (sender, peers) = tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    return None;
+                }
+                msg = rx.recv() => {
+                    match msg {
+                        Some(Message {
+                            sender,
+                            body: MessageBody::DiscoveryResponse { peers, .. },
+                        }) => {
+                            (sender, peers)
+                        },
+                        // channel is closed
+                        None => {
+                            return None;
+                        }
+                        // other message, ignore
+                        _ => {
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            if sender != peer_address.to_string() {
+                continue;
+            }
+
+            return Some((sender, peers));
         }
     }
 }
