@@ -1,6 +1,8 @@
 use connection_manager::connection_manager::ConnectionManager;
+use connection_manager::peer::Peer;
 use discovery::discovery::DiscoveryService;
 use message::message::MessageBody;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
@@ -68,9 +70,12 @@ impl GossipApp {
 
         cancellation_token.cancel();
 
+        connection_manager.shutdown().await;
+
         tracing::info!("Graceful shutdown completed, bye");
     }
 
+    // spawn a task for connection manager
     async fn run_connection_manager_task(
         &self,
         connection_manager: ConnectionManager,
@@ -106,6 +111,7 @@ impl GossipApp {
         });
     }
 
+    // spawn a task for discovery service
     async fn run_discovery_task(
         &self,
         connection_manager: ConnectionManager,
@@ -116,6 +122,7 @@ impl GossipApp {
         discovery.run(cancellation_token).await
     }
 
+    // spawn a task that broadcasts a message to all peers every `period` seconds
     async fn run_broadcast_task(
         &self,
         connection_manager: ConnectionManager,
@@ -127,41 +134,46 @@ impl GossipApp {
             async move {
                 loop {
                     tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(period as u64)) => {
-                            tracing::debug!("Broadcasting message to all peers");
-                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(period as u64)) => {}
                         _ = cancellation_token.cancelled() => {
                             break;
                         }
                     }
 
                     let peers = connection_manager.peers().await;
-                    let peer_num = peers.len();
 
-                    let futures: Vec<_> = peers
-                        .into_iter()
-                        .map(|(peer_addr, peer)| {
-                            let peer = peer.clone();
-                            tokio::spawn(async move {
-                                peer.send_message(
-                                    my_address,
-                                    MessageBody::GossipBroadcast {
-                                        message: "Hello, world".to_string(),
-                                    },
-                                )
-                                .await
-                                .expect("Failed to send message");
-
-                                tracing::debug!("Message sent to peer: {}", peer_addr);
-                            })
-                        })
-                        .collect();
-
-                    futures::future::join_all(futures).await;
-
-                    tracing::info!("Broadcasted message to {} peers", peer_num);
+                    Self::broadcast_message(peers, my_address).await;
                 }
             }
         });
+    }
+
+    async fn broadcast_message(peers: HashMap<SocketAddr, Peer>, my_address: SocketAddr) {
+        let peer_num = peers.len();
+
+        tracing::debug!("Broadcasting message to {} peers", peer_num);
+
+        let futures: Vec<_> = peers
+            .into_iter()
+            .map(|(peer_addr, peer)| {
+                let peer = peer.clone();
+                tokio::spawn(async move {
+                    peer.send_message(
+                        my_address,
+                        MessageBody::GossipBroadcast {
+                            message: "Hello, world".to_string(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+
+                    tracing::debug!("Message sent to peer: {}", peer_addr);
+                })
+            })
+            .collect();
+
+        futures::future::join_all(futures).await;
+
+        tracing::info!("Broadcasted message to {} peers", peer_num);
     }
 }

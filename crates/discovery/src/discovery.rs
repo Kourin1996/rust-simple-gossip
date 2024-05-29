@@ -68,30 +68,27 @@ impl DiscoveryService {
                     tracing::debug!("Waiting for peer event");
 
                     let ct = cancellation_token.clone();
-                    let event = tokio::select! {
+                    let (peer_address, peer) = tokio::select! {
                         _ = ct.cancelled() => {
                             break;
                         }
                         Some(event) = peer_event_rx.recv() => {
-                            event
+                            if let PeerEvent::Connected(peer_address, peer) = event {
+                                (peer_address, peer)
+                            } else {
+                                continue
+                            }
                         }
                     };
 
-                    tracing::debug!("Received peer event: {:?}", event);
-
-                    match event {
-                        PeerEvent::Connected(peer_address, peer) => {
-                            DiscoveryService::handle_connected(
-                                state.clone(),
-                                peer,
-                                peer_address,
-                                my_address,
-                                cancellation_token.clone(),
-                            )
-                            .await;
-                        }
-                        _ => {}
-                    }
+                    DiscoveryService::handle_connected(
+                        state.clone(),
+                        peer,
+                        peer_address,
+                        my_address,
+                        cancellation_token.clone(),
+                    )
+                    .await;
                 }
 
                 tracing::debug!("run_peer_event_handler finished");
@@ -133,15 +130,13 @@ impl DiscoveryService {
     ) {
         tracing::debug!("spawning run_discovery_request_handler");
 
-        let (tx, rx) = mpsc::channel::<Message>();
-        let mut rx = convert_mpsc_channel_to_tokio_channel(rx);
-
         tokio::spawn({
-            let id = peer.subscribe(tx).await;
-            let address = peer.address().await.unwrap();
             let state = state.clone();
 
-            tracing::debug!("Subscribed to peer message: {}", address);
+            let (tx, rx) = mpsc::channel::<Message>();
+            let mut rx = convert_mpsc_channel_to_tokio_channel(rx);
+
+            let id = peer.subscribe(tx).await;
 
             async move {
                 loop {
@@ -153,8 +148,6 @@ impl DiscoveryService {
                         msg = rx.recv() => {
                             match msg {
                                 Some(Message{sender, body: MessageBody::DiscoveryRequest {},..}) => {
-                                    tracing::debug!("Received DiscoveryRequest from {}", sender);
-
                                     sender
                                 }
                                 _ => {
@@ -163,6 +156,8 @@ impl DiscoveryService {
                             }
                         }
                     };
+
+                    tracing::debug!("Received DiscoveryRequest from {}", sender);
 
                     DiscoveryService::reply_discovery_response(
                         state.clone(),
@@ -297,16 +292,15 @@ impl DiscoveryService {
 
     async fn unsubscribe_message(state: Arc<SharedState>, addr: SocketAddr) {
         let res = state.peer_subscription_map.write().await.remove(&addr);
-        match res {
-            Some(PeerSubscriptionEntity {
-                index, mut peer, ..
-            }) => {
-                let ok = peer.unsubscribe(index).await;
-                if !ok {
-                    tracing::warn!("Failed to unsubscribe peer message because the subscription has been already removed");
-                }
+
+        if let Some(PeerSubscriptionEntity {
+            index, mut peer, ..
+        }) = res
+        {
+            let ok = peer.unsubscribe(index).await;
+            if !ok {
+                tracing::warn!("Failed to unsubscribe peer message because the subscription has been already removed");
             }
-            None => {}
         }
     }
 

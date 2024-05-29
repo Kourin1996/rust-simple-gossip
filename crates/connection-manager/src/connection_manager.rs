@@ -132,9 +132,15 @@ impl ConnectionManager {
     // shutdown all peers
     pub async fn shutdown(&self) {
         let mut peer_map = self.state.peer_map.write().await;
-        for (_, peer) in peer_map.iter() {
-            let _ = peer.shutdown().await;
-        }
+
+        let futures: Vec<_> = peer_map
+            .iter()
+            .map(|(_peer_addr, peer)| {
+                peer.shutdown()
+            })
+            .collect();
+
+        futures::future::join_all(futures).await;
 
         peer_map.clear();
     }
