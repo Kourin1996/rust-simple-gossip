@@ -12,6 +12,7 @@ use utils::channel::convert_mpsc_channel_to_tokio_channel;
 
 #[derive(Debug)]
 pub struct DiscoveryService {
+    // my server address
     my_address: SocketAddr,
     state: Arc<SharedState>,
 }
@@ -19,7 +20,9 @@ pub struct DiscoveryService {
 #[derive(Debug)]
 pub(self) struct SharedState {
     connection_manager: ConnectionManager,
+    // maps that holds peer event subscription
     peer_subscription_map: RwLock<HashMap<SocketAddr, PeerSubscriptionEntity>>,
+    // known peers
     known_peers: Arc<RwLock<HashSet<SocketAddr>>>,
 }
 
@@ -41,16 +44,18 @@ impl DiscoveryService {
         }
     }
 
+    // spawn the discovery service
     pub async fn run(&self, cancellation_token: CancellationToken) {
         self.run_peer_event_handler(cancellation_token).await;
     }
 
+    // spawn the peer event handler
     async fn run_peer_event_handler(&self, cancellation_token: CancellationToken) {
         tracing::debug!("spawning run_peer_event_handler");
 
         tokio::spawn({
             let state = self.state.clone();
-            let my_addr = self.my_address;
+            let my_address = self.my_address;
 
             async move {
                 let (peer_event_tx, peer_event_rx) = mpsc::channel();
@@ -62,9 +67,9 @@ impl DiscoveryService {
                 loop {
                     tracing::debug!("Waiting for peer event");
 
+                    let ct = cancellation_token.clone();
                     let event = tokio::select! {
-                        _ = cancellation_token.cancelled() => {
-                            tracing::debug!("Cancellation token is cancelled");
+                        _ = ct.cancelled() => {
                             break;
                         }
                         Some(event) = peer_event_rx.recv() => {
@@ -76,35 +81,48 @@ impl DiscoveryService {
 
                     match event {
                         PeerEvent::Connected(peer_address, peer) => {
-                            // TODO: create method
-                            state.known_peers.write().await.insert(peer_address);
-
-                            DiscoveryService::run_discovery_request_handler(
-                                my_addr,
-                                state.known_peers.clone(),
-                                peer.clone(),
-                                cancellation_token.clone(),
-                            )
-                            .await;
-
-                            DiscoveryService::request_peers_info(
+                            DiscoveryService::handle_connected(
                                 state.clone(),
-                                my_addr,
                                 peer,
+                                peer_address,
+                                my_address,
                                 cancellation_token.clone(),
                             )
                             .await;
                         }
-                        PeerEvent::Disconnected(peer_address, _peer) => {
-                            DiscoveryService::unsubscribe_message(state.clone(), peer_address)
-                                .await;
-                        }
+                        _ => {}
                     }
                 }
 
                 tracing::debug!("run_peer_event_handler finished");
             }
         });
+    }
+
+    async fn handle_connected(
+        state: Arc<SharedState>,
+        peer: Peer,
+        peer_address: SocketAddr,
+        my_address: SocketAddr,
+        cancellation_token: CancellationToken,
+    ) {
+        state.known_peers.write().await.insert(peer_address);
+
+        DiscoveryService::run_discovery_request_handler(
+            my_address,
+            state.known_peers.clone(),
+            peer.clone(),
+            cancellation_token.clone(),
+        )
+        .await;
+
+        DiscoveryService::request_peers_info(
+            state.clone(),
+            my_address,
+            peer.clone(),
+            cancellation_token.clone(),
+        )
+        .await;
     }
 
     async fn run_discovery_request_handler(
@@ -114,6 +132,7 @@ impl DiscoveryService {
         cancellation_token: CancellationToken,
     ) {
         tracing::debug!("spawning run_discovery_request_handler");
+
         let (tx, rx) = mpsc::channel::<Message>();
         let mut rx = convert_mpsc_channel_to_tokio_channel(rx);
 
@@ -125,45 +144,65 @@ impl DiscoveryService {
 
             async move {
                 loop {
-                    tokio::select! {
+                    let sender = tokio::select! {
                         _ = cancellation_token.cancelled() => {
                             peer.unsubscribe(id).await;
                             break;
                         }
                         msg = rx.recv() => {
-
                             match msg {
                                 Some(Message{sender, body: MessageBody::DiscoveryRequest {},..}) => {
                                     tracing::debug!("Received DiscoveryRequest from {}", sender);
 
-                                    let sender = sender.parse().unwrap();
-                                    let peers = known_peers
-                                        .read()
-                                        .await
-                                        .iter()
-                                        .filter_map(|addr| {
-                                            if *addr != my_addr && *addr != sender {
-                                                Some(addr.to_string())
-                                            } else {
-                                                None
-                                            }})
-                                        .collect::<Vec<_>>();
-
-                                    let response_message = MessageBody::DiscoveryResponse {
-                                        peers,
-                                    };
-
-                                    let _ = peer.send_message(my_addr, response_message).await;
-
-                                    tracing::debug!("Sent DiscoveryResponse to {}", sender);
+                                    sender
                                 }
-                                _ => {}
+                                _ => {
+                                    continue;
+                                }
                             }
                         }
-                    }
+                    };
+
+                    DiscoveryService::reply_discovery_response(
+                        peer.clone(),
+                        sender,
+                        my_addr,
+                        known_peers.clone(),
+                    )
+                    .await;
                 }
+
+                peer.unsubscribe(id).await;
             }
         });
+    }
+
+    async fn reply_discovery_response(
+        peer: Peer,
+        sender: String,
+        my_address: SocketAddr,
+        known_peers: Arc<RwLock<HashSet<SocketAddr>>>,
+    ) {
+        let sender = sender.parse().unwrap();
+        let peers = known_peers
+            .read()
+            .await
+            .iter()
+            .filter_map(|addr| {
+                if *addr != my_address && *addr != sender {
+                    Some(addr.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let peer_num = peers.len();
+
+        let _ = peer
+            .send_message(my_address, MessageBody::DiscoveryResponse { peers })
+            .await;
+
+        tracing::debug!("Sent DiscoveryResponse to {}, num={}", sender, peer_num);
     }
 
     // TODO: periodically send DiscoveryRequest to the peers
@@ -171,87 +210,109 @@ impl DiscoveryService {
     async fn request_peers_info(
         state: Arc<SharedState>,
         my_addr: SocketAddr,
-        mut peer: Peer,
+        peer: Peer,
         cancellation_token: CancellationToken,
     ) {
         tokio::spawn({
-            let peer_addr = peer.address().await.unwrap();
+            let peer_address = peer.address().await.expect("Failed to get peer address");
 
             async move {
-                let (tx, rx) = mpsc::channel::<Message>();
-
-                let subscription_index = peer.subscribe(tx).await;
-                let _ = state.peer_subscription_map.write().await.insert(
-                    peer_addr.clone(),
-                    PeerSubscriptionEntity {
-                        index: subscription_index,
-                        peer: peer.clone(),
-                    },
-                );
-
-                let request_message = MessageBody::DiscoveryRequest {};
+                let mut rx =
+                    DiscoveryService::subscribe_message(state.clone(), peer.clone(), peer_address)
+                        .await;
 
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
                         return;
                     }
-                    _ = peer.send_message(my_addr, request_message) => {}
+                    _ = peer.send_message(my_addr, MessageBody::DiscoveryRequest {}) => {}
                 }
 
-                tracing::debug!("Sent DiscoveryRequest to {}", peer_addr);
-
-                let mut rx = convert_mpsc_channel_to_tokio_channel(rx);
+                tracing::debug!("Sent DiscoveryRequest to {}", peer_address);
 
                 // await for the response
                 loop {
-                    let msg = tokio::select! {
+                    let (sender, peers) = tokio::select! {
                         _ = cancellation_token.cancelled() => {
                             break;
                         }
                         msg = rx.recv() => {
                             match msg {
-                                Some(msg) => msg,
+                                Some(Message {
+                                    sender,
+                                    body: MessageBody::DiscoveryResponse { peers, .. },
+                                }) => {
+                                    (sender, peers)
+                                },
                                 None => {
-                                    break;
+                                    break
+                                }
+                                _ => {
+                                    continue;
                                 }
                             }
                         }
                     };
 
-                    if msg.sender != peer_addr.to_string() {
+                    if sender != peer_address.to_string() {
                         continue;
                     }
 
-                    match msg {
-                        Message {
-                            sender,
-                            body: MessageBody::DiscoveryResponse { peers, .. },
-                        } => {
-                            tracing::debug!(
-                                "Received DiscoveryResponse from {} peers={:?}",
-                                sender,
-                                peers
-                            );
+                    tracing::debug!(
+                        "Received DiscoveryResponse from {} peers={:?}",
+                        sender,
+                        peers
+                    );
 
-                            let futures: Vec<_> = peers
-                                .iter()
-                                .filter_map(|peer| SocketAddr::from_str(peer).ok())
-                                .map(|peer_addr| {
-                                    state
-                                        .connection_manager
-                                        .connect(peer_addr, cancellation_token.clone())
-                                })
-                                .collect();
-
-                            futures::future::join_all(futures).await;
-                        }
-                        _ => {}
-                    }
+                    DiscoveryService::connect_to_multiple_peers(
+                        state.clone(),
+                        peers,
+                        cancellation_token.clone(),
+                    )
+                    .await;
                 }
 
-                DiscoveryService::unsubscribe_message(state, peer_addr).await;
+                DiscoveryService::unsubscribe_message(state, peer_address).await;
             }
         });
+    }
+
+    async fn connect_to_multiple_peers(
+        state: Arc<SharedState>,
+        peers: Vec<String>,
+        cancellation_token: CancellationToken,
+    ) {
+        let futures: Vec<_> = peers
+            .iter()
+            .filter_map(|peer| SocketAddr::from_str(peer).ok())
+            .map(|peer_addr| {
+                state
+                    .connection_manager
+                    .connect(peer_addr, cancellation_token.clone())
+            })
+            .collect();
+
+        futures::future::join_all(futures).await;
+    }
+
+    async fn subscribe_message(
+        state: Arc<SharedState>,
+        mut peer: Peer,
+        peer_address: SocketAddr,
+    ) -> tokio::sync::mpsc::Receiver<Message> {
+        let (tx, rx) = mpsc::channel::<Message>();
+        let rx = convert_mpsc_channel_to_tokio_channel(rx);
+
+        let index = peer.subscribe(tx).await;
+        let _ = state.peer_subscription_map.write().await.insert(
+            peer_address.clone(),
+            PeerSubscriptionEntity {
+                index,
+                peer: peer.clone(),
+            },
+        );
+
+        rx
     }
 
     async fn unsubscribe_message(state: Arc<SharedState>, addr: SocketAddr) {

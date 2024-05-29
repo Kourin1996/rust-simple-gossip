@@ -1,6 +1,7 @@
 use connection_manager::connection_manager::ConnectionManager;
 use discovery::discovery::DiscoveryService;
 use message::message::MessageBody;
+use std::net::SocketAddr;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
@@ -29,75 +30,35 @@ impl GossipApp {
 
         let tcp_listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", self.port))
             .await
-            .expect("Failed to bind to port");
+            .expect("failed to bind to port");
         let my_address = tcp_listener.local_addr().unwrap();
 
         let cancellation_token = CancellationToken::new();
 
         let connection_manager = ConnectionManager::new(my_address);
 
-        tokio::spawn({
-            let connection_manager = connection_manager.clone();
-            let cancellation_token = cancellation_token.clone();
-            let initial_peers = self
-                .initial_peers
-                .iter()
-                .map(|s| s.parse().expect("Failed to parse peer address"))
-                .collect();
+        self.run_connection_manager_task(
+            connection_manager.clone(),
+            tcp_listener,
+            self.initial_peers.clone(),
+            cancellation_token.clone(),
+        )
+        .await;
 
-            async move {
-                connection_manager
-                    .run(tcp_listener, initial_peers, cancellation_token)
-                    .await;
-            }
-        });
+        self.run_discovery_task(
+            connection_manager.clone(),
+            my_address,
+            cancellation_token.clone(),
+        )
+        .await;
 
-        let discovery = DiscoveryService::new(connection_manager.clone(), my_address);
-        tokio::spawn({
-            let cancellation_token = cancellation_token.clone();
-
-            async move {
-                discovery.run(cancellation_token).await;
-            }
-        });
-
-        tokio::spawn({
-            let connection_manager = connection_manager.clone();
-            let cancellation_token = cancellation_token.clone();
-            let period = self.broadcast_period;
-
-            async move {
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(period as u64)) => {
-                            tracing::debug!("Broadcasting message to all peers");
-
-                            let peers = connection_manager.peers().await;
-                            let peer_num = peers.len();
-                            for (addr, peer) in peers {
-                                let peer = peer.clone();
-                                tokio::spawn(async move {
-                                    let msg = MessageBody::GossipBroadcast {
-                                        message: "Hello, world".to_string(),
-                                    };
-
-                                    peer.send_message(
-                                        my_address,
-                                        msg).await.expect("Failed to send message");
-
-                                    tracing::debug!("Message sent to peer: {}", addr);
-                                });
-                            }
-
-                            tracing::info!("Broadcasted message to {} peers", peer_num);
-                        }
-                        _ = cancellation_token.cancelled() => {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        self.run_broadcast_task(
+            connection_manager.clone(),
+            my_address,
+            self.broadcast_period,
+            cancellation_token.clone(),
+        )
+        .await;
 
         signal::ctrl_c()
             .await
@@ -108,5 +69,99 @@ impl GossipApp {
         cancellation_token.cancel();
 
         tracing::info!("Graceful shutdown completed, bye");
+    }
+
+    async fn run_connection_manager_task(
+        &self,
+        connection_manager: ConnectionManager,
+        tcp_listener: tokio::net::TcpListener,
+        initial_peers: Vec<String>,
+        cancellation_token: CancellationToken,
+    ) {
+        tokio::spawn({
+            let connection_manager = connection_manager.clone();
+            let cancellation_token = cancellation_token.clone();
+            let initial_peers: Vec<_> = initial_peers
+                .iter()
+                .map(|s| {
+                    s.parse::<SocketAddr>()
+                        .expect("Failed to parse peer address")
+                })
+                .collect();
+
+            async move {
+                connection_manager
+                    .run(tcp_listener, cancellation_token.clone())
+                    .await;
+
+                for peer in initial_peers {
+                    let res = connection_manager
+                        .connect(peer, cancellation_token.clone())
+                        .await;
+                    if let Err(e) = res {
+                        tracing::error!("Failed to connect to peer: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    async fn run_discovery_task(
+        &self,
+        connection_manager: ConnectionManager,
+        my_address: SocketAddr,
+        cancellation_token: CancellationToken,
+    ) {
+        let discovery = DiscoveryService::new(connection_manager.clone(), my_address);
+        discovery.run(cancellation_token).await
+    }
+
+    async fn run_broadcast_task(
+        &self,
+        connection_manager: ConnectionManager,
+        my_address: SocketAddr,
+        period: u32,
+        cancellation_token: CancellationToken,
+    ) {
+        tokio::spawn({
+            async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(period as u64)) => {
+                            tracing::debug!("Broadcasting message to all peers");
+                        }
+                        _ = cancellation_token.cancelled() => {
+                            break;
+                        }
+                    }
+
+                    let peers = connection_manager.peers().await;
+                    let peer_num = peers.len();
+
+                    let futures: Vec<_> = peers
+                        .into_iter()
+                        .map(|(peer_addr, peer)| {
+                            let peer = peer.clone();
+                            tokio::spawn(async move {
+                                peer.send_message(
+                                    my_address,
+                                    MessageBody::GossipBroadcast {
+                                        message: "Hello, world".to_string(),
+                                    },
+                                )
+                                .await
+                                .expect("Failed to send message");
+
+                                tracing::debug!("Message sent to peer: {}", peer_addr);
+                            })
+                        })
+                        .collect();
+
+                    futures::future::join_all(futures).await;
+
+                    tracing::info!("Broadcasted message to {} peers", peer_num);
+                }
+            }
+        });
     }
 }
