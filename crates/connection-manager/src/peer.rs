@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::mpsc;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::{Mutex, RwLock};
@@ -64,7 +64,7 @@ impl Peer {
         my_address: SocketAddr,
         message: MessageBody,
     ) -> std::io::Result<usize> {
-        let message = Message {
+        let mut message = Message {
             sender: my_address.to_string(),
             body: message,
         }
@@ -72,7 +72,9 @@ impl Peer {
 
         let mut write_stream = self.state.write_stream.lock().await;
 
-        let size = write_stream.write(&message).await?;
+        message.push('\n');
+
+        let size = write_stream.write(message.as_bytes()).await?;
         write_stream.flush().await?;
 
         Ok(size)
@@ -144,15 +146,15 @@ impl Peer {
 
             async move {
                 let mut read_stream = state.read_stream.lock().await;
-
-                let mut buf = vec![0; 1024];
+                let mut reader = BufReader::new(&mut *read_stream);
 
                 loop {
+                    let mut line = String::new();
                     let res = tokio::select! {
                         _ = cancellation_token.cancelled() => {
                             break;
                         }
-                        res = read_stream.read(&mut buf) => {
+                        res = reader.read_line(&mut line) => {
                             res
                         }
                     };
@@ -194,7 +196,7 @@ impl Peer {
                         break;
                     }
 
-                    Peer::notify_message(&state.message_subscribers, &buf[..n], peer_address).await;
+                    Peer::notify_message(&state.message_subscribers, line, peer_address).await;
                 }
             }
         });
@@ -203,7 +205,7 @@ impl Peer {
     // notifies the message to all the subscribers
     async fn notify_message(
         subscribers: &RwLock<HashMap<usize, mpsc::Sender<Message>>>,
-        message: &[u8],
+        message: String,
         peer_address: Option<SocketAddr>,
     ) {
         let message = Message::decode(message);
