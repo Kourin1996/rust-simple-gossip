@@ -9,7 +9,7 @@ use tokio::task;
 pub fn convert_mpsc_channel_to_tokio_channel<T: Send + 'static>(
     receiver: mpsc::Receiver<T>,
 ) -> tokio_mpsc::Receiver<T> {
-    let (tx, rx) = tokio_mpsc::channel::<T>(1);
+    let (tx, rx) = tokio_mpsc::channel::<T>(10);
 
     task::spawn_blocking(move || {
         while let Ok(msg) = receiver.recv() {

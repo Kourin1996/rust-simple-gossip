@@ -25,6 +25,7 @@ impl fmt::Debug for PeerEvent {
     }
 }
 
+// ConnectionManager provides the functionality to manage the connections to the peers
 #[derive(Debug, Clone)]
 pub struct ConnectionManager {
     state: Arc<SharedState>,

@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use utils::channel::convert_mpsc_channel_to_tokio_channel;
 
+// Peer represents a connected peer and provides methods to interact with it
 #[derive(Debug, Clone)]
 pub struct Peer {
     my_address: SocketAddr,
