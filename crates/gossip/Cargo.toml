@@ -3,9 +3,8 @@ name = "gossip"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
+utils.workspace = true
 connection-manager.workspace = true
 discovery.workspace = true
 message.workspace = true
