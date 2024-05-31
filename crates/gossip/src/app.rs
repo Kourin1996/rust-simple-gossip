@@ -25,6 +25,7 @@ impl GossipApp {
         }
     }
 
+    // starts the gossip server
     pub async fn run(&self) {
         tracing::debug!(
             "Gossip Server starting, port={}, period={}, initial peers=[{}]",
@@ -36,6 +37,7 @@ impl GossipApp {
         let cancellation_token = CancellationToken::new();
 
         tokio::spawn({
+            // listen for ctrl-c signal and cancel the token upon receiving it
             let cancellation_token = cancellation_token.clone();
 
             async move {
@@ -52,6 +54,7 @@ impl GossipApp {
         self.setup_and_run(cancellation_token).await;
     }
 
+    // setup and run the gossip server
     async fn setup_and_run(&self, cancellation_token: CancellationToken) {
         let tcp_listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", self.port))
             .await
@@ -134,6 +137,7 @@ impl GossipApp {
         });
     }
 
+    // spawn a task for receiving messages from a peer and logging the received message
     async fn run_peer_message_reception_task(
         mut peer: Peer,
         cancellation_token: CancellationToken,
@@ -202,6 +206,7 @@ impl GossipApp {
         });
     }
 
+    // spawn a task that connects to initial peers
     async fn run_initial_peers_connection_task(
         connection_manager: ConnectionManager,
         initial_peers: Vec<String>,
@@ -229,6 +234,7 @@ impl GossipApp {
         });
     }
 
+    // broadcast a message to all peers
     async fn broadcast_message(peers: HashMap<SocketAddr, Peer>) {
         let peer_num = peers.len();
         if peer_num == 0 {
@@ -273,6 +279,7 @@ impl GossipApp {
         tracing::info!("Sending message [{}] to [{}]", msg, formatted_addrs);
     }
 
+    // generate a random string of length `length`
     fn generate_random_string(length: usize) -> String {
         let charset: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
                            abcdefghijklmnopqrstuvwxyz\
