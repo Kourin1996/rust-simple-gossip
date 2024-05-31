@@ -77,22 +77,30 @@ impl ConnectionManager {
     // connect to a peer by address
     pub async fn connect(
         &self,
-        addr: SocketAddr,
+        peer_address: SocketAddr,
         cancellation_token: CancellationToken,
     ) -> Result<(), io::Error> {
-        if self.state.peer_map.read().await.get(&addr).is_some() {
+        if let Some(_) = self.state.peer_map.read().await.get(&peer_address) {
             return Ok(());
         }
 
-        ConnectionManager::connect_impl(
-            addr,
-            self.state.my_address,
-            &self.state.peer_map,
-            &self.state.peer_event_subscribers,
-            self.state.disconnection_tx.clone(),
+        let state = self.state.clone();
+
+        tracing::debug!("Connecting to peer: {}", peer_address);
+
+        let stream = TcpStream::connect(peer_address).await?;
+
+        let mut peer = Peer::new(stream, state.my_address, state.disconnection_tx.clone());
+
+        let _ = Self::initialize_peer(
+            &mut peer,
+            &state.peer_map,
+            &state.peer_event_subscribers,
             cancellation_token,
         )
         .await?;
+
+        tracing::debug!("Outgoing connection established: {}", peer_address);
 
         Ok(())
     }
@@ -111,6 +119,7 @@ impl ConnectionManager {
             .write()
             .await
             .insert(index, sender);
+
         tracing::debug!("Subscribed to peer events");
 
         index
@@ -124,6 +133,7 @@ impl ConnectionManager {
             .write()
             .await
             .remove(&index);
+
         tracing::debug!("Unsubscribed from peer events");
 
         res.is_some()
@@ -135,9 +145,7 @@ impl ConnectionManager {
 
         let futures: Vec<_> = peer_map
             .iter()
-            .map(|(_peer_addr, peer)| {
-                peer.shutdown()
-            })
+            .map(|(_peer_addr, peer)| peer.shutdown())
             .collect();
 
         futures::future::join_all(futures).await;
@@ -149,10 +157,9 @@ impl ConnectionManager {
     fn run_peer_reception(&self, tcp_listener: TcpListener, cancellation_token: CancellationToken) {
         tokio::spawn({
             let state = self.state.clone();
+            let my_address = state.my_address;
 
             async move {
-                let my_address = state.my_address;
-
                 loop {
                     let ct = cancellation_token.clone();
                     let peer_result = tokio::select! {
@@ -174,36 +181,25 @@ impl ConnectionManager {
 
                     tracing::debug!("Accepted connection from: {}", peer_ephemeral_address);
 
-                    let mut peer = Peer::new(stream, state.disconnection_tx.clone());
+                    let mut peer = Peer::new(stream, my_address, state.disconnection_tx.clone());
 
-                    let peer_address = ConnectionManager::initialize_peer_task(
+                    let peer_address = Self::initialize_peer(
                         &mut peer,
-                        my_address,
+                        &state.peer_map,
+                        &state.peer_event_subscribers,
                         cancellation_token.clone(),
                     )
                     .await;
 
-                    let peer_address = match peer_address {
-                        Ok(peer_address) => peer_address,
-                        Err(_) => {
-                            tracing::warn!("Failed to initialize peer task, closing connection");
+                    match peer_address {
+                        Ok(peer_address) => {
+                            tracing::debug!("Incoming connection established: {}", peer_address);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to initialize peer task: {:?}", e);
                             continue;
                         }
-                    };
-
-                    state
-                        .peer_map
-                        .write()
-                        .await
-                        .insert(peer_address, peer.clone());
-
-                    ConnectionManager::notify_peer_event(
-                        PeerEvent::Connected(peer_address, peer.clone()),
-                        &state.peer_event_subscribers,
-                    )
-                    .await;
-
-                    tracing::debug!("Incoming connection established: {}", peer_address);
+                    }
                 }
             }
         });
@@ -243,7 +239,7 @@ impl ConnectionManager {
                         let peer_address = peer.address().await;
 
                         if let Some(peer_address) = peer_address {
-                            ConnectionManager::notify_peer_event(
+                            Self::notify_peer_event(
                                 PeerEvent::Disconnected(peer_address, peer.clone()),
                                 &state.peer_event_subscribers,
                             )
@@ -257,66 +253,24 @@ impl ConnectionManager {
         });
     }
 
-    // implementation to connect to a peer by address
-    async fn connect_impl(
-        peer_address: SocketAddr,
-        my_address: SocketAddr,
+    // initialize peer
+    async fn initialize_peer(
+        peer: &mut Peer,
         peer_map: &RwLock<HashMap<SocketAddr, Peer>>,
         peer_event_subscribers: &RwLock<HashMap<usize, mpsc::Sender<PeerEvent>>>,
-        disconnect_ch: tokio_mpsc::Sender<SocketAddr>,
-        cancellation_token: CancellationToken,
-    ) -> Result<(), std::io::Error> {
-        tracing::debug!("Connecting to peer: {}", peer_address);
-
-        // panic here
-        let stream = TcpStream::connect(peer_address).await?;
-
-        let mut peer = Peer::new(stream, disconnect_ch);
-
-        peer.run(cancellation_token.clone()).await;
-
-        // notify my port to the peer
-        peer.send_message(my_address, MessageBody::Handshake {})
-            .await
-            .unwrap();
-
-        tracing::debug!("Handshake sent to peer: {:?}", peer_address);
-
-        peer.await_handshake().await;
-
-        tracing::debug!("Handshake received from peer: {:?}", peer_address);
-
-        peer_map.write().await.insert(peer_address, peer.clone());
-
-        tracing::debug!("Outgoing connection established: {}", peer_address);
-
-        ConnectionManager::notify_peer_event(
-            PeerEvent::Connected(peer_address, peer.clone()),
-            peer_event_subscribers,
-        )
-        .await;
-
-        Ok(())
-    }
-
-    // initialize the peer task
-    async fn initialize_peer_task(
-        peer: &mut Peer,
-        my_address: SocketAddr,
         cancellation_token: CancellationToken,
     ) -> Result<SocketAddr, io::Error> {
+        // run the peer task
+        peer.run(cancellation_token.clone()).await;
+
         // spawn awaiting handshake task before starting to read data
         let handler = tokio::spawn({
             let mut peer = peer.clone();
             async move { peer.await_handshake().await }
         });
 
-        peer.run(cancellation_token.clone()).await;
-
-        match peer
-            .send_message(my_address, MessageBody::Handshake {})
-            .await
-        {
+        // send handshake to peer
+        match peer.send_message(MessageBody::Handshake {}).await {
             Ok(_) => {}
             Err(e) => {
                 tracing::warn!("Failed to send handshake to peer");
@@ -328,17 +282,29 @@ impl ConnectionManager {
 
         handler.await?;
 
-        match peer.address().await {
-            Some(address) => Ok(address),
+        // get the peer address
+        let peer_address = match peer.address().await {
+            Some(address) => address,
             None => {
                 tracing::warn!("Failed to get address from peer");
 
-                Err(io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::Other,
                     "Failed to get address from peer",
-                ))
+                ));
             }
-        }
+        };
+
+        // insert the peer to the map and publish an event
+        peer_map.write().await.insert(peer_address, peer.clone());
+
+        Self::notify_peer_event(
+            PeerEvent::Connected(peer_address, peer.clone()),
+            peer_event_subscribers,
+        )
+        .await;
+
+        Ok(peer_address)
     }
 
     // notify peer event to subscribers
@@ -356,5 +322,255 @@ impl ConnectionManager {
             event,
             subscribers.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::connection_manager::ConnectionManager;
+    use crate::peer::Peer;
+    use std::net::SocketAddr;
+    use std::sync::mpsc;
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+    use utils::channel::convert_mpsc_channel_to_tokio_channel;
+
+    async fn new_connection_manager(
+        cancellation_token: CancellationToken,
+    ) -> (ConnectionManager, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connection_manager = ConnectionManager::new(address);
+
+        connection_manager.run(listener, cancellation_token).await;
+
+        return (connection_manager, address);
+    }
+
+    async fn new_server() -> (TcpListener, SocketAddr) {
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+
+        (server, address)
+    }
+
+    #[tokio::test]
+    async fn test_outgoing_connect() {
+        let cancellation_token = CancellationToken::new();
+        let (connection_manager, _) = new_connection_manager(cancellation_token.clone()).await;
+        let (peer_server, peer_address) = new_server().await;
+
+        // send handshake from peer
+        tokio::spawn({
+            async move {
+                let (stream, _) = peer_server.accept().await.unwrap();
+                let peer = Peer::new(stream, peer_address, tokio::sync::mpsc::channel(1).0);
+
+                peer.send_message(message::message::MessageBody::Handshake {})
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let mut rx = convert_mpsc_channel_to_tokio_channel(rx);
+        let _ = connection_manager.subscribe(tx).await;
+
+        tokio::select! {
+            res = connection_manager.connect(peer_address, cancellation_token.clone()) => {
+                assert!(res.is_ok());
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                panic!("Timeout");
+            }
+        }
+
+        // make sure the connected event is delivered
+        tokio::select! {
+            x = rx.recv() => {
+                match x {
+                    Some(super::PeerEvent::Connected(address, _)) => {
+                        assert_eq!(address, peer_address);
+                    },
+                    _ => {
+                        panic!("Invalid event");
+                    }
+                }
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                panic!("Timeout");
+            }
+        }
+
+        // check peers map
+        let peers = connection_manager.peers().await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers.contains_key(&peer_address), true);
+    }
+
+    #[tokio::test]
+    async fn test_incoming_connect() {
+        let cancellation_token = CancellationToken::new();
+        let (my_connection_manager, my_address) =
+            new_connection_manager(cancellation_token.clone()).await;
+        let (peer_connection_manager, peer_address) =
+            new_connection_manager(cancellation_token.clone()).await;
+
+        let (tx, rx) = mpsc::channel();
+        let mut rx = convert_mpsc_channel_to_tokio_channel(rx);
+        let _ = my_connection_manager.subscribe(tx).await;
+
+        tokio::select! {
+            x = peer_connection_manager.connect(my_address, cancellation_token.clone()) => {
+                assert!(x.is_ok());
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("Timeout 1");
+            }
+        }
+
+        // make sure the connected event is delivered
+        tokio::select! {
+            x = rx.recv() => {
+                match x {
+                    Some(super::PeerEvent::Connected(address, _)) => {
+                        assert_eq!(address, peer_address);
+                    },
+                    _ => {
+                        panic!("Invalid event");
+                    }
+                }
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("Timeout 2");
+            }
+        }
+
+        // check peers map
+        let peers = my_connection_manager.peers().await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers.contains_key(&peer_address), true);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown() {
+        let cancellation_token = CancellationToken::new();
+        let (my_connection_manager, my_address) =
+            new_connection_manager(cancellation_token.clone()).await;
+        let (peer_connection_manager, peer_address) =
+            new_connection_manager(cancellation_token.clone()).await;
+
+        let (tx, rx) = mpsc::channel();
+        let mut rx = convert_mpsc_channel_to_tokio_channel(rx);
+        let _ = peer_connection_manager.subscribe(tx).await;
+
+        // connecting
+        tokio::select! {
+            x = my_connection_manager.connect(peer_address, cancellation_token.clone()) => {
+                assert!(x.is_ok());
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("Timeout 1");
+            }
+        }
+
+        // wait for peer to connect
+        tokio::select! {
+            x = rx.recv() => {
+                match x {
+                    Some(super::PeerEvent::Connected(address, _)) => {
+                        assert_eq!(address, my_address);
+                    },
+                    _ => {
+                        panic!("Invalid event");
+                    }
+                }
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("Timeout 2");
+            }
+        }
+
+        // make sure both have each other in the peers map
+        let my_peers = my_connection_manager.peers().await;
+        assert_eq!(my_peers.len(), 1);
+        assert!(my_peers.contains_key(&peer_address));
+
+        let peers_peers = peer_connection_manager.peers().await;
+        assert_eq!(peers_peers.len(), 1);
+        assert!(peers_peers.contains_key(&my_address));
+
+        // shutdown
+        my_connection_manager.shutdown().await;
+
+        // waiting for peer to disconnect from my node
+        tokio::select! {
+            x = rx.recv() => {
+                match x {
+                    Some(super::PeerEvent::Disconnected(address, _)) => {
+                        assert_eq!(address, my_address);
+                    },
+                    _ => {
+                        panic!("Invalid event");
+                    }
+                }
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("Timeout 2");
+            }
+        }
+
+        // make sure both peers are empty
+        let my_peers = my_connection_manager.peers().await;
+        assert_eq!(my_peers.len(), 0);
+
+        let peers_peers = peer_connection_manager.peers().await;
+        assert_eq!(peers_peers.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_disconnected() {
+        let cancellation_token = CancellationToken::new();
+        let (my_connection_manager, my_address) =
+            new_connection_manager(cancellation_token.clone()).await;
+        let (peer_connection_manager, peer_address) =
+            new_connection_manager(cancellation_token.clone()).await;
+
+        let cancellation_token = CancellationToken::new();
+
+        let (tx, rx) = mpsc::channel();
+        let mut rx = convert_mpsc_channel_to_tokio_channel(rx);
+        let _ = my_connection_manager.subscribe(tx).await;
+
+        tokio::select! {
+            x = peer_connection_manager.connect(my_address, cancellation_token.clone()) => {
+                assert!(x.is_ok());
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("Timeout 1");
+            }
+        }
+
+        // ignore the connected event
+        let _ = rx.recv().await;
+
+        peer_connection_manager.shutdown().await;
+
+        tokio::select! {
+            x = rx.recv() => {
+                match x {
+                    Some(super::PeerEvent::Disconnected(address, _)) => {
+                        assert_eq!(address, peer_address);
+                    },
+                    _ => {
+                        println!("debug::received {:?}", x);
+                        panic!("Invalid event");
+                    }
+                }
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("Timeout 3");
+            }
+        }
     }
 }

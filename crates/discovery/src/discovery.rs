@@ -115,7 +115,6 @@ impl DiscoveryService {
 
         DiscoveryService::request_peers_info(
             state.clone(),
-            my_address,
             peer.clone(),
             cancellation_token.clone(),
         )
@@ -196,7 +195,7 @@ impl DiscoveryService {
         let peer_num = peers.len();
 
         let _ = peer
-            .send_message(my_address, MessageBody::DiscoveryResponse { peers })
+            .send_message(MessageBody::DiscoveryResponse { peers })
             .await;
 
         tracing::debug!("Sent DiscoveryResponse to {}, num={}", sender, peer_num);
@@ -204,7 +203,6 @@ impl DiscoveryService {
 
     async fn request_peers_info(
         state: Arc<SharedState>,
-        my_addr: SocketAddr,
         peer: Peer,
         cancellation_token: CancellationToken,
     ) {
@@ -220,7 +218,7 @@ impl DiscoveryService {
                     _ = cancellation_token.cancelled() => {
                         return;
                     }
-                    _ = peer.send_message(my_addr, MessageBody::DiscoveryRequest {}) => {}
+                    _ = peer.send_message(MessageBody::DiscoveryRequest {}) => {}
                 }
 
                 tracing::debug!("Sent DiscoveryRequest to {}", peer_address);

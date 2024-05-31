@@ -12,6 +12,7 @@ use utils::channel::convert_mpsc_channel_to_tokio_channel;
 
 #[derive(Debug, Clone)]
 pub struct Peer {
+    my_address: SocketAddr,
     state: Arc<SharedState>,
 }
 
@@ -32,10 +33,15 @@ struct SharedState {
 }
 
 impl Peer {
-    pub fn new(stream: TcpStream, disconnection_tx: tokio_mpsc::Sender<SocketAddr>) -> Self {
+    pub fn new(
+        stream: TcpStream,
+        my_address: SocketAddr,
+        disconnection_tx: tokio_mpsc::Sender<SocketAddr>,
+    ) -> Self {
         let (read_stream, write_stream) = tokio::io::split(stream);
 
         Self {
+            my_address,
             state: Arc::new(SharedState {
                 address: RwLock::new(None),
                 read_stream: Mutex::new(read_stream),
@@ -47,25 +53,25 @@ impl Peer {
         }
     }
 
+    // returns the peer's address
     pub async fn address(&self) -> Option<SocketAddr> {
         self.state.address.read().await.clone()
     }
 
+    // runs the peer message reception loop
     pub async fn run(&self, cancellation_token: CancellationToken) {
         self.run_message_reception(cancellation_token).await;
     }
 
+    // closes the connection
     pub async fn shutdown(&self) -> std::io::Result<()> {
         self.state.write_stream.lock().await.shutdown().await
     }
 
-    pub async fn send_message(
-        &self,
-        my_address: SocketAddr,
-        message: MessageBody,
-    ) -> std::io::Result<usize> {
+    // sends a message to the peer
+    pub async fn send_message(&self, message: MessageBody) -> std::io::Result<usize> {
         let mut message = Message {
-            sender: my_address.to_string(),
+            sender: self.my_address.to_string(),
             body: message,
         }
         .encode();
@@ -80,6 +86,7 @@ impl Peer {
         Ok(size)
     }
 
+    // subscribes to the peer messages
     pub async fn subscribe(&mut self, tx: mpsc::Sender<Message>) -> usize {
         let mut message_subscribers = self.state.message_subscribers.write().await;
 
@@ -97,6 +104,7 @@ impl Peer {
         index
     }
 
+    // unsubscribes from the peer messages
     pub async fn unsubscribe(&mut self, index: usize) -> bool {
         let mut message_subscribers = self.state.message_subscribers.write().await;
         let res = message_subscribers.remove(&index);
@@ -116,23 +124,20 @@ impl Peer {
         loop {
             let message = rx.recv().await.unwrap();
 
-            match message.body {
-                MessageBody::Handshake => {
-                    let address = match message.sender.parse() {
-                        Ok(address) => address,
-                        Err(_) => {
-                            tracing::warn!("Invalid address: {:?}", message.sender);
-                            continue;
-                        }
-                    };
+            if let MessageBody::Handshake = message.body {
+                let address = match message.sender.parse() {
+                    Ok(address) => address,
+                    Err(_) => {
+                        tracing::warn!("Invalid address: {:?}", message.sender);
+                        continue;
+                    }
+                };
 
-                    state.address.write().await.replace(address);
+                state.address.write().await.replace(address);
 
-                    tracing::debug!("Received handshake message: address={:?}", address);
+                tracing::debug!("Received handshake message: address={:?}", address);
 
-                    break;
-                }
-                _ => continue,
+                break;
             }
         }
 
@@ -150,18 +155,18 @@ impl Peer {
 
                 loop {
                     let mut line = String::new();
-                    let res = tokio::select! {
+                    let read_size = tokio::select! {
                         _ = cancellation_token.cancelled() => {
                             break;
                         }
-                        res = reader.read_line(&mut line) => {
-                            res
+                        read_size = reader.read_line(&mut line) => {
+                            read_size
                         }
                     };
 
                     let peer_address = state.address.read().await.clone();
 
-                    let n = match res {
+                    let n = match read_size {
                         Ok(n) => n,
                         Err(e) => match e.kind() {
                             std::io::ErrorKind::ConnectionReset => {
@@ -172,7 +177,7 @@ impl Peer {
                                     e
                                 );
 
-                                Peer::notify_peer_disconnection(
+                                Self::notify_peer_disconnection(
                                     peer_address,
                                     &state.disconnection_tx,
                                 )
@@ -190,13 +195,13 @@ impl Peer {
                     if n == 0 {
                         tracing::debug!("connection closed: {:?}", peer_address);
 
-                        Peer::notify_peer_disconnection(peer_address, &state.disconnection_tx)
+                        Self::notify_peer_disconnection(peer_address, &state.disconnection_tx)
                             .await;
 
                         break;
                     }
 
-                    Peer::notify_message(&state.message_subscribers, line, peer_address).await;
+                    Self::notify_message(&state.message_subscribers, line, peer_address).await;
                 }
             }
         });
@@ -228,11 +233,239 @@ impl Peer {
         address: Option<SocketAddr>,
         channel: &tokio_mpsc::Sender<SocketAddr>,
     ) {
-        match address {
-            Some(address) => {
-                let _ = channel.send(address).await;
+        if let Some(address) = address {
+            let _ = channel.send(address).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::peer::Peer;
+    use message::message::{Message, MessageBody};
+    use std::io::ErrorKind::BrokenPipe;
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+    use std::string::FromUtf8Error;
+    use std::sync::mpsc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc::Receiver;
+    use tokio::task::JoinHandle;
+    use tokio_util::sync::CancellationToken;
+
+    async fn open_random_server_helper() -> (TcpListener, SocketAddr) {
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+
+        (server, address)
+    }
+
+    async fn spawn_raw_message_reception_helper(
+        listener: TcpListener,
+    ) -> JoinHandle<Result<String, FromUtf8Error>> {
+        tokio::spawn({
+            async move {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 1024];
+
+                let n = connection.read(&mut buffer).await.unwrap();
+
+                String::from_utf8(Vec::from(&buffer[..n]))
             }
-            None => {}
+        })
+    }
+
+    async fn setup_peer_helper(
+        peer_address: SocketAddr,
+        my_address: SocketAddr,
+        should_run_task: bool,
+        cancellation_token: CancellationToken,
+    ) -> (Peer, Receiver<SocketAddr>) {
+        let peer_connection = TcpStream::connect(peer_address).await.unwrap();
+
+        let (disconnection_tx, disconnect_rx) = tokio::sync::mpsc::channel(1);
+        let peer = Peer::new(peer_connection, my_address, disconnection_tx);
+
+        if should_run_task {
+            peer.run(cancellation_token.clone()).await;
+        }
+
+        (peer, disconnect_rx)
+    }
+
+    async fn subscribe_message_helper(peer: &mut Peer) -> (Receiver<Message>, usize) {
+        let (tx, rx) = mpsc::channel();
+        let index = peer.subscribe(tx).await;
+        let rx = utils::channel::convert_mpsc_channel_to_tokio_channel(rx);
+
+        (rx, index)
+    }
+
+    async fn await_connection_and_send_message_helper(peer_server: &TcpListener, msg: Message) {
+        let (mut peer_stream, _) = peer_server.accept().await.unwrap();
+
+        peer_stream
+            .write(format!("{}\n", msg.encode()).as_bytes())
+            .await
+            .unwrap();
+        peer_stream.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_send_message() {
+        let my_address = SocketAddr::from_str("127.0.0.1:80").unwrap();
+        let msg_body = MessageBody::GossipBroadcast {
+            message: "Hello, world!".to_string(),
+        };
+        let msg = Message {
+            sender: my_address.to_string(),
+            body: msg_body.clone(),
+        };
+
+        let (peer_server, peer_address) = open_random_server_helper().await;
+
+        let peer_message_reception_handler = spawn_raw_message_reception_helper(peer_server);
+
+        let (peer, _) =
+            setup_peer_helper(peer_address, my_address, false, CancellationToken::new()).await;
+
+        peer.send_message(msg_body.clone()).await.unwrap();
+
+        tokio::select! {
+            received = peer_message_reception_handler.await => {
+                let received = received.unwrap();
+
+                assert_eq!(received, Ok(msg.encode() + "\n"))
+            },
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                panic!("Timeout");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_message_to_closed_stream() {
+        let my_address = SocketAddr::from_str("127.0.0.1:80").unwrap();
+
+        let msg_body = MessageBody::GossipBroadcast {
+            message: "Hello, world!".to_string(),
+        };
+
+        let (_peer_server, peer_address) = open_random_server_helper().await;
+
+        let (peer, _) =
+            setup_peer_helper(peer_address, my_address, false, CancellationToken::new()).await;
+
+        peer.shutdown().await.unwrap();
+
+        let res = peer.send_message(msg_body).await;
+
+        assert!(!res.is_ok());
+
+        if let Err(err) = res {
+            assert_eq!(err.kind(), BrokenPipe);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subscribe() {
+        let my_address = SocketAddr::from_str("127.0.0.1:80").unwrap();
+        let msg_body = MessageBody::GossipBroadcast {
+            message: "Hello, world!".to_string(),
+        };
+
+        let (peer_server, peer_address) = open_random_server_helper().await;
+
+        let cancellation_token = CancellationToken::new();
+        let (mut peer, _) =
+            setup_peer_helper(peer_address, my_address, true, cancellation_token.clone()).await;
+
+        let (mut rx, index) = subscribe_message_helper(&mut peer).await;
+
+        let msg = Message {
+            sender: peer_address.to_string(),
+            body: msg_body.clone(),
+        };
+
+        await_connection_and_send_message_helper(&peer_server, msg.clone()).await;
+
+        assert_eq!(index, 0);
+
+        tokio::select! {
+            received = rx.recv() => {
+                assert_eq!(received, Some(msg));
+                peer.unsubscribe(index).await;
+            },
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                peer.unsubscribe(index).await;
+                panic!("Timeout");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handshake() {
+        let my_address = SocketAddr::from_str("127.0.0.1:80").unwrap();
+        let (peer_server, peer_address) = open_random_server_helper().await;
+
+        let cancellation_token = CancellationToken::new();
+        let (mut peer, _) =
+            setup_peer_helper(peer_address, my_address, true, cancellation_token.clone()).await;
+
+        // send handshake from peer to notify its address
+        let (mut stream, _) = peer_server.accept().await.unwrap();
+        let handshake = Message {
+            sender: peer_address.to_string(),
+            body: MessageBody::Handshake,
+        }
+        .encode();
+
+        stream
+            .write(format!("{}\n", handshake).as_bytes())
+            .await
+            .unwrap();
+        stream.flush().await.expect("failed to flush");
+
+        peer.await_handshake().await;
+
+        assert_eq!(peer.address().await, Some(peer_address));
+    }
+
+    #[tokio::test]
+    async fn test_notify_peer_disconnection() {
+        let my_address = SocketAddr::from_str("127.0.0.1:80").unwrap();
+        let (peer_server, peer_address) = open_random_server_helper().await;
+
+        let cancellation_token = CancellationToken::new();
+        let (mut peer, mut disconnection_rx) =
+            setup_peer_helper(peer_address, my_address, true, cancellation_token.clone()).await;
+
+        // send handshake from peer to notify its address
+        let (mut stream, _) = peer_server.accept().await.unwrap();
+        let handshake = Message {
+            sender: peer_address.to_string(),
+            body: MessageBody::Handshake,
+        }
+        .encode();
+        stream
+            .write(format!("{}\n", handshake).as_bytes())
+            .await
+            .unwrap();
+        stream.flush().await.expect("failed to flush");
+
+        peer.await_handshake().await;
+
+        // close connection by peer
+        stream.shutdown().await.expect("shutdown failed");
+
+        tokio::select! {
+            res = disconnection_rx.recv() => {
+                assert_eq!(res, Some(peer_address));
+            },
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                panic!("Timeout");
+            }
         }
     }
 }

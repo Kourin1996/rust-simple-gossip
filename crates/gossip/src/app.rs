@@ -56,7 +56,6 @@ impl GossipApp {
 
         self.run_broadcast_task(
             connection_manager.clone(),
-            my_address,
             self.broadcast_period,
             cancellation_token.clone(),
         )
@@ -126,7 +125,6 @@ impl GossipApp {
     async fn run_broadcast_task(
         &self,
         connection_manager: ConnectionManager,
-        my_address: SocketAddr,
         period: u32,
         cancellation_token: CancellationToken,
     ) {
@@ -142,13 +140,13 @@ impl GossipApp {
 
                     let peers = connection_manager.peers().await;
 
-                    Self::broadcast_message(peers, my_address).await;
+                    Self::broadcast_message(peers).await;
                 }
             }
         });
     }
 
-    async fn broadcast_message(peers: HashMap<SocketAddr, Peer>, my_address: SocketAddr) {
+    async fn broadcast_message(peers: HashMap<SocketAddr, Peer>) {
         let peer_num = peers.len();
 
         tracing::debug!("Broadcasting message to {} peers", peer_num);
@@ -158,12 +156,9 @@ impl GossipApp {
             .map(|(peer_addr, peer)| {
                 let peer = peer.clone();
                 tokio::spawn(async move {
-                    peer.send_message(
-                        my_address,
-                        MessageBody::GossipBroadcast {
-                            message: "Hello, world".to_string(),
-                        },
-                    )
+                    peer.send_message(MessageBody::GossipBroadcast {
+                        message: "Hello, world".to_string(),
+                    })
                     .await
                     .unwrap();
 
