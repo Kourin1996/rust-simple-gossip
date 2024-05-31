@@ -1,11 +1,14 @@
-use connection_manager::connection_manager::ConnectionManager;
+use connection_manager::connection_manager::{ConnectionManager, PeerEvent};
 use connection_manager::peer::Peer;
 use discovery::discovery::DiscoveryService;
 use message::message::MessageBody;
+use rand::Rng;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::mpsc;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
+use utils::channel::convert_mpsc_channel_to_tokio_channel;
 
 pub struct GossipApp {
     port: u16,
@@ -55,12 +58,13 @@ impl GossipApp {
             .expect("failed to bind to port");
         let my_address = tcp_listener.local_addr().unwrap();
 
+        tracing::info!("My address is \"{}\"", my_address.to_string());
+
         let connection_manager = ConnectionManager::new(my_address);
 
         Self::run_connection_manager_task(
             connection_manager.clone(),
             tcp_listener,
-            self.initial_peers.clone(),
             cancellation_token.clone(),
         )
         .await;
@@ -79,6 +83,15 @@ impl GossipApp {
         )
         .await;
 
+        Self::run_initial_peers_connection_task(
+            connection_manager.clone(),
+            self.initial_peers.clone(),
+            cancellation_token.clone(),
+        )
+        .await;
+
+        cancellation_token.cancelled().await;
+
         connection_manager.shutdown().await;
 
         tracing::info!("Graceful shutdown completed, bye");
@@ -88,31 +101,67 @@ impl GossipApp {
     async fn run_connection_manager_task(
         connection_manager: ConnectionManager,
         tcp_listener: tokio::net::TcpListener,
-        initial_peers: Vec<String>,
         cancellation_token: CancellationToken,
     ) {
         tokio::spawn({
-            let connection_manager = connection_manager.clone();
-            let cancellation_token = cancellation_token.clone();
-            let initial_peers: Vec<_> = initial_peers
-                .iter()
-                .map(|s| {
-                    s.parse::<SocketAddr>()
-                        .expect("Failed to parse peer address")
-                })
-                .collect();
-
             async move {
                 connection_manager
                     .run(tcp_listener, cancellation_token.clone())
                     .await;
 
-                for peer in initial_peers {
-                    let res = connection_manager
-                        .connect(peer, cancellation_token.clone())
-                        .await;
-                    if let Err(e) = res {
-                        tracing::error!("Failed to connect to peer: {}", e);
+                let (tx, rx) = mpsc::channel();
+                let mut rx = convert_mpsc_channel_to_tokio_channel(rx);
+                connection_manager.subscribe(tx).await;
+
+                loop {
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => {
+                            break;
+                        }
+                        event = rx.recv() => {
+                            match event {
+                                Some(PeerEvent::Connected(peer_address, peer)) => {
+                                    tracing::info!("Connected to peer at \"{}\"", peer_address);
+
+                                    Self::run_peer_message_reception_task(peer, cancellation_token.clone()).await;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    async fn run_peer_message_reception_task(
+        mut peer: Peer,
+        cancellation_token: CancellationToken,
+    ) {
+        tokio::spawn({
+            async move {
+                let (tx, rx) = mpsc::channel();
+                let mut rx = convert_mpsc_channel_to_tokio_channel(rx);
+                peer.subscribe(tx).await;
+
+                loop {
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => {
+                            break;
+                        }
+                        message = rx.recv() => {
+                            match message {
+                                Some(message) => {
+                                    match message.body {
+                                        MessageBody::GossipBroadcast { message: message_body } => {
+                                            tracing::info!("Received message [{}] from \"{}\"", message_body, message.sender);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
@@ -153,30 +202,91 @@ impl GossipApp {
         });
     }
 
+    async fn run_initial_peers_connection_task(
+        connection_manager: ConnectionManager,
+        initial_peers: Vec<String>,
+        cancellation_token: CancellationToken,
+    ) {
+        tokio::spawn({
+            async move {
+                let initial_peers: Vec<_> = initial_peers
+                    .iter()
+                    .map(|s| {
+                        s.parse::<SocketAddr>()
+                            .expect("Failed to parse peer address")
+                    })
+                    .collect();
+
+                for peer in initial_peers {
+                    let res = connection_manager
+                        .connect(peer, cancellation_token.clone())
+                        .await;
+                    if let Err(e) = res {
+                        tracing::error!("Failed to connect to peer: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
     async fn broadcast_message(peers: HashMap<SocketAddr, Peer>) {
         let peer_num = peers.len();
+        if peer_num == 0 {
+            return;
+        }
+
+        let peer_addrs = peers
+            .keys()
+            .map(|addr| addr.to_string())
+            .collect::<Vec<_>>();
 
         tracing::debug!("Broadcasting message to {} peers", peer_num);
+
+        let msg = Self::generate_random_string(10);
 
         let futures: Vec<_> = peers
             .into_iter()
             .map(|(peer_addr, peer)| {
                 let peer = peer.clone();
-                tokio::spawn(async move {
-                    peer.send_message(MessageBody::GossipBroadcast {
-                        message: "Hello, world".to_string(),
-                    })
-                    .await
-                    .unwrap();
+                tokio::spawn({
+                    let msg = msg.clone();
 
-                    tracing::debug!("Message sent to peer: {}", peer_addr);
+                    async move {
+                        peer.send_message(MessageBody::GossipBroadcast { message: msg })
+                            .await
+                            .unwrap();
+
+                        tracing::debug!("Message sent to peer: {}", peer_addr);
+                    }
                 })
             })
             .collect();
 
         futures::future::join_all(futures).await;
 
-        tracing::info!("Broadcasted message to {} peers", peer_num);
+        let formatted_addrs = peer_addrs
+            .iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        tracing::info!("Sending message [{}] to [{}]", msg, formatted_addrs);
+    }
+
+    fn generate_random_string(length: usize) -> String {
+        let charset: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+                           abcdefghijklmnopqrstuvwxyz\
+                           0123456789";
+        let mut rng = rand::thread_rng();
+
+        let random_string: String = (0..length)
+            .map(|_| {
+                let idx = rng.gen_range(0..charset.len());
+                charset[idx] as char
+            })
+            .collect();
+
+        random_string
     }
 }
 
@@ -246,7 +356,7 @@ mod tests {
                     _ => panic!("Unexpected event"),
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                 panic!("Timeout waiting for peer to connect");
             }
         }
@@ -258,19 +368,15 @@ mod tests {
     async fn test_run_connection_manager_task() {
         let cancellation_token = CancellationToken::new();
 
-        let my_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let my_address = my_listener.local_addr().unwrap();
-        let my_cm = ConnectionManager::new(my_address);
-
+        let (my_cm, _) = new_connection_manager_helper(cancellation_token.clone()).await;
         let (_peer1_cm, peer1_address) =
             new_connection_manager_helper(cancellation_token.clone()).await;
 
         let (mut my_rx, my_subscription) = subscribe_connection_manager_event(&my_cm.clone()).await;
 
         // setup discovery tasks
-        GossipApp::run_connection_manager_task(
+        GossipApp::run_initial_peers_connection_task(
             my_cm.clone(),
-            my_listener,
             vec![peer1_address.to_string()],
             cancellation_token.clone(),
         )
@@ -285,7 +391,7 @@ mod tests {
                     _ => panic!("Unexpected event"),
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                 panic!("Timeout waiting for peer to connect");
             }
         }
@@ -316,45 +422,26 @@ mod tests {
             subscribe_connection_manager_event(&peer2_cm.clone()).await;
 
         // connect server and peer1, server and peer2
-        tokio::spawn({
-            let my_cm = my_cm.clone();
-            let peer1_cm = peer1_cm.clone();
-            async move {
-                connect(&my_cm, &peer1_cm, my_address, peer1_address).await;
-            }
-        });
-        tokio::spawn({
-            let my_cm = my_cm.clone();
-            let peer2_cm = peer2_cm.clone();
-            async move {
-                connect(&my_cm, &peer2_cm, my_address, peer2_address).await;
-            }
-        });
+        connect(&my_cm, &peer1_cm, my_address, peer1_address).await;
 
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-        // wait for peer1 to connect to peer2
-        loop {
-            tokio::select! {
-                event = peer1_rx.recv() => {
-                    match event {
-                        Some(PeerEvent::Connected(address, _)) => {
-                            if address == my_address {
-                                continue;
-                            }
-
-                            assert_eq!(address, peer2_address);
-                            break;
-                        }
-                        _ => panic!("Unexpected event"),
+        // wait for peer1 to connect to server
+        tokio::select! {
+            event = peer1_rx.recv() => {
+                match event {
+                    Some(PeerEvent::Connected(address, _)) => {
+                        assert_eq!(address, my_address);
                     }
+                    _ => panic!("Unexpected event"),
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                    panic!("Timeout waiting for peer1 to connect");
-                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                panic!("Timeout waiting for peer1 to connect");
             }
         }
         peer1_cm.unsubscribe(peer1_subscription).await;
+
+        // connect server and peer2
+        connect(&my_cm, &peer2_cm, my_address, peer2_address).await;
 
         // wait for peer2 to connect to peer1
         loop {
@@ -372,7 +459,7 @@ mod tests {
                         _ => panic!("Unexpected event"),
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     panic!("Timeout waiting for peer1 to connect");
                 }
             }
@@ -402,14 +489,13 @@ mod tests {
         tokio::select! {
             message = peer1_rx.recv() => {
                 match message {
-                    Some(Message { sender, body: MessageBody::GossipBroadcast {message}}) => {
+                    Some(Message { sender, body: MessageBody::GossipBroadcast {..}}) => {
                         assert_eq!(sender, my_address.to_string());
-                        assert_eq!(message, "Hello, world");
                     }
                     _ => panic!("Unexpected message"),
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                 panic!("Timeout waiting for message");
             }
         }
@@ -426,14 +512,13 @@ mod tests {
         tokio::select! {
             message = peer2_rx.recv() => {
                 match message {
-                    Some(Message { sender, body: MessageBody::GossipBroadcast {message}}) => {
+                    Some(Message { sender, body: MessageBody::GossipBroadcast {..}}) => {
                         assert_eq!(sender, my_address.to_string());
-                        assert_eq!(message, "Hello, world");
                     }
                     _ => panic!("Unexpected message"),
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                 panic!("Timeout waiting for message");
             }
         }

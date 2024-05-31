@@ -7,6 +7,7 @@ use std::str::FromStr;
 use std::sync::mpsc;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use utils::channel::convert_mpsc_channel_to_tokio_channel;
 
@@ -224,6 +225,8 @@ impl DiscoveryService {
             let peer_address = peer.address().await.expect("Failed to get peer address");
 
             async move {
+                sleep(tokio::time::Duration::from_millis(100)).await;
+
                 let mut rx =
                     DiscoveryService::subscribe_message(state.clone(), peer.clone(), peer_address)
                         .await;

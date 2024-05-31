@@ -18,13 +18,10 @@ pub enum MessageBody {
 
 impl Message {
     pub fn encode(&self) -> String {
-        let encoded = serde_json::to_string(&self).unwrap();
-        tracing::debug!("Encoding message: {:?}", encoded);
-        encoded
+        serde_json::to_string(&self).unwrap()
     }
 
     pub fn decode(msg: String) -> Self {
-        tracing::debug!("Decoding message: {:?}", msg);
         serde_json::from_str(msg.as_str()).unwrap()
     }
 }

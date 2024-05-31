@@ -12,8 +12,11 @@ pub fn convert_mpsc_channel_to_tokio_channel<T: Send + 'static>(
     let (tx, rx) = tokio_mpsc::channel::<T>(10);
 
     task::spawn_blocking(move || {
+        let tx = tx.clone();
+
         while let Ok(msg) = receiver.recv() {
             let tx = tx.clone();
+
             task::block_in_place(move || {
                 tx.try_send(msg).unwrap();
             });
