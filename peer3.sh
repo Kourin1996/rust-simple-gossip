@@ -1,3 +1,3 @@
 #!/bin/sh
 
-./peer --port 8082 --period 8 --connect 127.0.0.1:8080
+./peer --period=7 --port=8082 --connect="127.0.0.1:8080" | tee output3.txt

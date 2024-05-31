@@ -1,3 +1,3 @@
 #!/bin/sh
 
-./peer --port 8080 --period 5
+./peer --period=5 --port=8080 | tee output1.txt
